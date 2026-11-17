@@ -135,15 +135,11 @@ class TaskMixture(Task):
         self.tasks = tasks
         self.lengths = [len(task) for task in self.tasks]
         self.num_conversations = sum(self.lengths)
-        # Build list of all (task_idx, local_idx) pairs
-        self.index_map = []
-        for task_idx, task_length in enumerate(self.lengths):
-            for local_idx in range(task_length):
-                self.index_map.append((task_idx, local_idx))
-        # Deterministically shuffle to mix tasks throughout training
-        rng = random.Random(42)
-        rng.shuffle(self.index_map)
-        # Note: this is not the most elegant or best solution, but it's ok for now
+        self.starts = np.cumsum([0] + self.lengths) # conversation i of the concatenated tasks is in task searchsorted(starts, i)
+        # Deterministically shuffle to mix tasks throughout training (kept as a compact array)
+        order = list(range(self.num_conversations))
+        random.Random(42).shuffle(order)
+        self.order = np.array(order, dtype=np.int64)
 
     def num_examples(self):
         return self.num_conversations
@@ -154,8 +150,9 @@ class TaskMixture(Task):
         This ensures tasks are mixed throughout training, regardless of dataset size.
         """
         assert 0 <= index < self.num_conversations, f"Index {index} out of range for mixture with {self.num_conversations} conversations"
-        task_idx, local_idx = self.index_map[index]
-        return self.tasks[task_idx][local_idx]
+        position = int(self.order[index])
+        task_idx = int(np.searchsorted(self.starts, position, side="right")) - 1
+        return self.tasks[task_idx][position - int(self.starts[task_idx])]
 
 
 class TaskSequence(Task):

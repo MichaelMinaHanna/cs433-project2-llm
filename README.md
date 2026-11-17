@@ -779,6 +779,9 @@ Checklist:
   Keep the default `L` elsewhere.
 * **Out of memory**: lower `--device-batch-size` (32 → 16 → 8 …). Gradient accumulation keeps the effective batch
   (`--batch-size` sequences per step) and therefore the results unchanged.
+* **Little RAM** (e.g. a notebook server): the data is streamed from disk, so RAM use does not grow with the data.
+  `prepare_data` needs about 2 GB with `--num-workers 4`. Each worker is a separate process, so use fewer workers
+  if RAM is tight.
 * **Multi-GPU**: `torchrun --standalone --nproc_per_node=<n> -m scripts.<script> -- <args>`. FLOPs are identical,
   only faster. The optimizer state is saved per GPU, so `chat_sft` (which warm-starts from the pretraining
   optimizer) must run on the same number of GPUs as the pretraining run, or with `--load-optimizer 0`.

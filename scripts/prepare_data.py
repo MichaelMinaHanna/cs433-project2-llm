@@ -85,7 +85,8 @@ SOURCES = {
 def _task_conversations(make_task):
     def read():
         task = make_task()
-        return [task[i] for i in range(len(task))]
+        for i in range(len(task)):
+            yield task[i]
     return read
 
 def _sft_registry():
@@ -145,7 +146,11 @@ def download_all(urls, raw_dir, num_workers):
 # Turning a source spec into (parts, to_doc) for the pipeline
 
 def _parquet_reader(path, columns):
-    return lambda: pq.read_table(path, columns=columns).to_pylist()
+    """The rows of a raw parquet file, streamed a batch at a time (never the whole file in memory)."""
+    def read():
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096, columns=columns):
+            yield from batch.to_pylist()
+    return read
 
 
 def pretrain_parts(name, spec, num_workers):

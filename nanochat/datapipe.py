@@ -22,6 +22,7 @@ Stages, for every source (pretraining text or SFT conversations):
                hashes, counts after every stage, decontamination results, declared data FLOPs, a fingerprint
 A source is "built" iff its manifest exists. Training scripts only accept built sources and record their
 fingerprints in the compute ledger of every checkpoint.
+Memory: records are streamed, and the kept documents wait on disk (not in RAM) until they are shuffled and written.
 """
 
 import os
@@ -31,6 +32,7 @@ import shutil
 import random
 import hashlib
 import importlib
+from array import array
 from datetime import datetime, timezone
 from multiprocessing import Pool
 
@@ -44,6 +46,7 @@ PIPELINE_VERSION = "1.1"
 NGRAM, NGRAM_SHORT = 13, 8
 ROW_GROUP_SIZE = 1024
 TRAIN_PART_DOCS = 200_000 # pretraining documents per output parquet file
+DECONTAM_BATCH = 16_384 # documents held in memory at a time while they are checked
 
 # -----------------------------------------------------------------------------
 # Locations
@@ -109,9 +112,11 @@ def content_sha256(path):
     if not path.endswith(".parquet"):
         return sha256_file(path)
     h = hashlib.sha256()
-    for text in pq.read_table(path, columns=["text"]).column("text").to_pylist():
-        h.update(text.encode("utf-8"))
-        h.update(b"\x00")
+    pf = pq.ParquetFile(path)
+    for i in range(pf.num_row_groups): # one row group at a time
+        for text in pf.read_row_group(i, columns=["text"]).column(0).to_pylist():
+            h.update(text.encode("utf-8"))
+            h.update(b"\x00")
     return h.hexdigest()
 
 
@@ -148,11 +153,82 @@ def _write_parquet(texts, path):
     pq.write_table(pa.Table.from_pydict({"text": texts}), path, row_group_size=ROW_GROUP_SIZE)
 
 
-def _write_jsonl(docs, path):
+class _Spill:
+    """Kept documents on disk, one UTF-8 payload each (the text, or the JSON of a conversation), read back by index."""
+
+    def __init__(self, path):
+        self.path = path
+        self.writer = open(path, "wb")
+        self.reader = None
+        self.clear()
+
+    def clear(self):
+        self.writer.seek(0)
+        self.writer.truncate()
+        self.offsets, self.sizes, self.chars = array("q"), array("q"), array("q")
+        self.end = 0
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def add(self, payload, chars):
+        data = payload.encode("utf-8")
+        self.writer.write(data)
+        self.offsets.append(self.end)
+        self.sizes.append(len(data))
+        self.chars.append(chars)
+        self.end += len(data)
+
+    def get(self, i):
+        self.writer.flush()
+        if self.reader is None:
+            self.reader = open(self.path, "rb")
+        self.reader.seek(self.offsets[i])
+        return self.reader.read(self.sizes[i]).decode("utf-8")
+
+    def close(self):
+        self.writer.close()
+        if self.reader is not None:
+            self.reader.close()
+
+
+class _TrainParquetWriter:
+    """Writes pretraining documents as they come into part_*.parquet files of TRAIN_PART_DOCS documents, in row groups
+    of ROW_GROUP_SIZE (the same files as writing each part at once)."""
+
+    def __init__(self, out_dir):
+        self.out_dir, self.files, self.writer, self.in_file, self.buffer = out_dir, [], None, 0, []
+
+    def add(self, text):
+        self.buffer.append(text)
+        if len(self.buffer) == ROW_GROUP_SIZE or self.in_file + len(self.buffer) == TRAIN_PART_DOCS:
+            self._write()
+
+    def _write(self):
+        if self.writer is None:
+            path = os.path.join(self.out_dir, f"part_{len(self.files):05d}.parquet")
+            os.makedirs(self.out_dir, exist_ok=True)
+            self.writer = pq.ParquetWriter(path, pa.schema([("text", pa.string())]))
+            self.files.append(path)
+        self.writer.write_table(pa.Table.from_pydict({"text": self.buffer}), row_group_size=ROW_GROUP_SIZE)
+        self.in_file += len(self.buffer)
+        self.buffer = []
+        if self.in_file == TRAIN_PART_DOCS:
+            self.writer.close()
+            self.writer, self.in_file = None, 0
+
+    def close(self):
+        if self.buffer:
+            self._write()
+        if self.writer is not None:
+            self.writer.close()
+
+
+def _write_jsonl(spill, indices, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for d in docs:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+        for i in indices:
+            f.write(spill.get(i) + "\n")
 
 # -----------------------------------------------------------------------------
 # The pipeline
@@ -172,7 +248,7 @@ def exclude_signature(exclude):
 
 def build_source(name, kind, spec, parts, to_doc, suite_dirs, num_workers=8, force=False, log=print, exclude=frozenset()):
     """
-    Build one source. `parts` is a list of (input_info: dict, read: callable -> list of raw records);
+    Build one source. `parts` is a list of (input_info: dict, read: callable -> iterable of raw records);
     `to_doc(record)` formats a record into a document (or None to drop it). `exclude`: keys (doc_key) of documents
     to drop as contaminated, e.g. the RL problems that overlap the evaluation pools.
     spec keys used here: val_docs (pretraining, default 2000), val_fraction (SFT, default 0.05, at most 500),
@@ -194,8 +270,11 @@ def build_source(name, kind, spec, parts, to_doc, suite_dirs, num_workers=8, for
             f"{out_dir} exists but was not built by the pipeline (no manifest). Move it away and rerun.")
         shutil.rmtree(out_dir)
     tmp_dir = out_dir + ".building"
-    if os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir)
+    spill_dir = out_dir + ".spill"
+    for d in (tmp_dir, spill_dir):
+        if os.path.exists(d):
+            shutil.rmtree(d)
+    os.makedirs(spill_dir)
 
     seed = int(spec.get("seed", 1337))
     max_docs = int(spec.get("max_docs", -1))
@@ -205,28 +284,35 @@ def build_source(name, kind, spec, parts, to_doc, suite_dirs, num_workers=8, for
     n_excluded = 0
     seen = set()
     inputs = []
-    train_files, kept_sft = [], []
-    pending = [] # pretraining documents waiting to be written
+    # kept documents wait on disk: pretraining, those of the current part; conversations, those of all parts
+    spill = _Spill(os.path.join(spill_dir, "kept"))
+    kept_sft = [] # conversations: indices into the spill, in order
+    train_writer = _TrainParquetWriter(os.path.join(tmp_dir, "train")) if kind == "pretrain" else None
     val_done = kind != "pretrain"
     chars = 0
 
-    def flush(final=False):
-        nonlocal pending
-        while pending and (final or len(pending) >= TRAIN_PART_DOCS):
-            chunk, pending = pending[:TRAIN_PART_DOCS], pending[TRAIN_PART_DOCS:]
-            path = os.path.join(tmp_dir, "train", f"part_{len(train_files):05d}.parquet")
-            _write_parquet(chunk, path)
-            train_files.append(path)
+    def decontaminate(docs):
+        """Spill the documents that share no n-gram with an evaluation suite; returns the number of the others."""
+        texts = [doc_text(d) for d in docs]
+        hits = [h for chunk in pool.map(_flag_chunk, [texts[i:i + 256] for i in range(0, len(texts), 256)]) for h in chunk]
+        for doc, text, h in zip(docs, texts, hits):
+            if h:
+                counts["contaminated"] += 1
+                if len(contaminated_examples) < 20:
+                    contaminated_examples.append({"eval_items": h[:3], "text": text[:200]})
+            else:
+                spill.add(doc if kind == "pretrain" else json.dumps(doc, ensure_ascii=False), len(text))
+        return sum(bool(h) for h in hits)
 
     with Pool(processes=num_workers, initializer=_init_worker, initargs=(suite_dirs,)) as pool:
         for part_idx, (info, read) in enumerate(parts):
             if 0 < max_docs <= counts["train"] + len(kept_sft):
                 break
-            records = read()
             inputs.append(info)
-            counts["raw"] += len(records)
-            docs = []
-            for record in records:
+            first = len(spill)
+            docs, n_unique, n_contaminated = [], 0, 0
+            for record in read():
+                counts["raw"] += 1
                 doc = to_doc(record)
                 if doc is None or not doc_text(doc).strip():
                     counts["empty"] += 1
@@ -244,35 +330,32 @@ def build_source(name, kind, spec, parts, to_doc, suite_dirs, num_workers=8, for
                     n_excluded += 1
                     continue
                 docs.append(doc)
-            del records
-            texts = [doc_text(d) for d in docs]
-            hits = [h for chunk in pool.map(_flag_chunk, [texts[i:i + 256] for i in range(0, len(texts), 256)]) for h in chunk]
-            kept = []
-            for doc, text, h in zip(docs, texts, hits):
-                if h:
-                    counts["contaminated"] += 1
-                    if len(contaminated_examples) < 20:
-                        contaminated_examples.append({"eval_items": h[:3], "text": text[:200]})
-                else:
-                    kept.append(doc)
+                if len(docs) == DECONTAM_BATCH:
+                    n_unique, n_contaminated = n_unique + len(docs), n_contaminated + decontaminate(docs)
+                    docs = []
+            n_unique, n_contaminated = n_unique + len(docs), n_contaminated + decontaminate(docs)
+            docs = []
+            kept = list(range(first, len(spill))) # the kept documents of this part, shuffled
             random.Random(seed + part_idx).shuffle(kept)
             if kind == "pretrain":
                 if not val_done:
                     n_val = min(int(spec.get("val_docs", 2000)), len(kept) // 10)
-                    _write_parquet(kept[:n_val], os.path.join(tmp_dir, "val", "part_00000.parquet"))
+                    _write_parquet([spill.get(i) for i in kept[:n_val]], os.path.join(tmp_dir, "val", "part_00000.parquet"))
                     counts["val"] = n_val
                     kept = kept[n_val:]
                     val_done = True
                 if max_docs > 0:
                     kept = kept[:max(0, max_docs - counts["train"])]
                 counts["train"] += len(kept)
-                chars += sum(len(t) for t in kept)
-                pending.extend(kept)
-                flush()
+                for i in kept:
+                    chars += spill.chars[i]
+                    train_writer.add(spill.get(i))
+                spill.clear()
             else:
                 kept_sft.extend(kept)
-            log(f"[{name}] part {part_idx + 1}/{len(parts)}: {len(docs):,} unique documents, {sum(bool(h) for h in hits):,} contaminated")
-        flush(final=True)
+            log(f"[{name}] part {part_idx + 1}/{len(parts)}: {n_unique:,} unique documents, {n_contaminated:,} contaminated")
+    if train_writer is not None:
+        train_writer.close()
 
     if kind != "pretrain": # conversations (SFT sources, RL problems)
         random.Random(seed).shuffle(kept_sft)
@@ -280,12 +363,13 @@ def build_source(name, kind, spec, parts, to_doc, suite_dirs, num_workers=8, for
         val, train = kept_sft[:n_val], kept_sft[n_val:]
         if max_docs > 0:
             train = train[:max_docs]
-        _write_jsonl(train, os.path.join(tmp_dir, "train.jsonl"))
-        train_files.append(os.path.join(tmp_dir, "train.jsonl"))
+        _write_jsonl(spill, train, os.path.join(tmp_dir, "train.jsonl"))
         if val:
-            _write_jsonl(val, os.path.join(tmp_dir, "val.jsonl"))
+            _write_jsonl(spill, val, os.path.join(tmp_dir, "val.jsonl"))
         counts["train"], counts["val"] = len(train), len(val)
-        chars = sum(len(doc_text(d)) for d in train)
+        chars = sum(spill.chars[i] for i in train)
+    spill.close()
+    shutil.rmtree(spill_dir)
     assert counts["train"] > 0, f"[{name}] no training documents left after the pipeline: {counts}"
 
     outputs = []
