@@ -1,0 +1,14 @@
+{
+  "comment": "Shared data sources for the Project 2 pretraining mixture comparison.",
+  "pretrain": {
+    "fineweb": {"registry": "fineweb", "num_shards": 4},
+    "finemath": {"registry": "finemath", "num_shards": 5},
+    "codeparrot": {"registry": "codeparrot", "num_shards": 4}
+  },
+  "sft": {
+    "gsm8k": {"registry": "gsm8k"},
+    "mbpp": {"registry": "mbpp"},
+    "tinygsm": {"registry": "tinygsm", "max_docs": 21000},
+    "smoltalk": {"registry": "smoltalk", "max_docs": 46000}
+  }
+}
