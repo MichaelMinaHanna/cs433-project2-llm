@@ -1,0 +1,7 @@
+{
+  "comment": "Pretraining token intake targets: 80% FineWeb and 20% FineMath.",
+  "sources": {
+    "fineweb": 0.8,
+    "finemath": 0.2
+  }
+}
